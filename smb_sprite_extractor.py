@@ -4,7 +4,7 @@ SMB Sprite Extractor
 Extracts sprites from a Super Mario Bros. NES ROM.
 
 Usage:
-    python3 smb_sprite_extractor.py [rom.nes] [output_dir] [theme] [--indexed]
+    python3 smb_sprite_extractor.py [rom.nes] [output_dir] [theme] [--indexed] [--individual] [--upscale-8x]
 
 Defaults:
     rom.nes    → ../smb.nes
@@ -15,6 +15,9 @@ Flags:
     --indexed  Export palette-indexed sprites (R channel encodes index 1/2/3)
                for runtime palette swapping via shader. Also emits palettes.json
                and a reference Godot shader file.
+    --individual  Export each sprite frame as a separate PNG in output_dir/sprites
+                  instead of building spritesheet.png/spritesheet.json.
+    --upscale-8x  Export sprite output at 8x size using nearest-neighbor scaling.
 
 Requires: Pillow  (pip install Pillow)
 
@@ -298,6 +301,27 @@ def _align8(val: int) -> int:
     return (val + 7) // 8 * 8
 
 
+def _upscale_if_needed(img: Image.Image, upscale8x: bool) -> Image.Image:
+    if not upscale8x:
+        return img
+    return img.resize((img.width * 8, img.height * 8), resample=Image.NEAREST)
+
+
+def _export_individual_sprites(
+    all_frames: dict[str, list[Image.Image]],
+    output_dir: pathlib.Path,
+    upscale8x: bool,
+) -> None:
+    sprites_dir = output_dir / "sprites"
+    sprites_dir.mkdir(parents=True, exist_ok=True)
+    for anim_name, frames in all_frames.items():
+        for frame_idx, frame_img in enumerate(frames):
+            key = anim_name if len(frames) == 1 else f"{anim_name}_{frame_idx}"
+            out_path = sprites_dir / f"{key}.png"
+            _upscale_if_needed(frame_img, upscale8x).save(out_path)
+    print(f"  Saved per-sprite PNGs in {sprites_dir}")
+
+
 def build_master_spritesheet(all_frames: dict) -> Image.Image:
     """Lay out every sprite frame in an organized grid, 8x8-aligned.
 
@@ -349,6 +373,8 @@ def export_all(
     output_dir: pathlib.Path,
     theme: str = "overworld",
     indexed: bool = False,
+    individual: bool = False,
+    upscale8x: bool = False,
 ) -> None:
     import json
 
@@ -367,6 +393,14 @@ def export_all(
         print("Mode: indexed (palette-index encoding for shader swap)")
     else:
         print(f"Mode: colored (theme={theme})")
+    if individual:
+        print("Output: per-sprite PNG files")
+    else:
+        print("Output: master spritesheet")
+    if upscale8x:
+        print("Scale: 8x (nearest-neighbor)")
+    else:
+        print("Scale: native")
 
     # --- Player sprites ---
     print("Rendering player sprites ...")
@@ -400,50 +434,58 @@ def export_all(
         compose_bowser(all_frames["bowser_mouth_closed"][0], all_frames["bowser_step_left"][0]),
     ]
 
-    # --- Master spritesheet ---
-    print("Building master spritesheet ...")
-    sheet = build_master_spritesheet(all_frames)
     output_dir.mkdir(parents=True, exist_ok=True)
-    sheet_path = output_dir / "spritesheet.png"
-    sheet.save(sheet_path)
-    print(f"  Saved {sheet_path}  ({sheet.width}×{sheet.height})")
+    if individual:
+        print("Exporting individual sprite images ...")
+        _export_individual_sprites(all_frames, output_dir, upscale8x)
+    else:
+        # --- Master spritesheet ---
+        print("Building master spritesheet ...")
+        sheet = build_master_spritesheet(all_frames)
+        sheet = _upscale_if_needed(sheet, upscale8x)
+        sheet_path = output_dir / "spritesheet.png"
+        sheet.save(sheet_path)
+        print(f"  Saved {sheet_path}  ({sheet.width}×{sheet.height})")
 
-    # --- Sprite metadata ---
-    meta: dict = {"mode": "indexed" if indexed else "colored", "sprites": {}}
-    if not indexed:
-        meta["theme"] = theme
-    y = 0
-    for row_entries in SPRITESHEET_ROWS:
-        rh = _align8(max(all_frames[n][f].height for n, f in row_entries))
-        x = 0
-        for name, fi in row_entries:
-            img = all_frames[name][fi]
-            key = name if len(all_frames[name]) == 1 else f"{name}_{fi}"
-            entry: dict = {
-                "x": x, "y": y + rh - img.height,
-                "w": img.width, "h": img.height,
-            }
-            if indexed:
-                if name in PLAYER_ANIMATIONS:
-                    entry["palette_slot"] = PLAYER_PALETTE_SLOT
-                elif name == "bowser":
-                    entry["palette_slot"] = ACTOR_ANIMATIONS["bowser_mouth_opened"]["palette"]
-                else:
-                    base_name = name
-                    for bname in ACTOR_ANIMATIONS:
-                        if name == bname or name.startswith(bname):
-                            base_name = bname
-                            break
-                    slot = _actor_palette_slot(base_name)
-                    if slot is not None:
-                        entry["palette_slot"] = slot
+        # --- Sprite metadata ---
+        scale = 8 if upscale8x else 1
+        meta: dict = {"mode": "indexed" if indexed else "colored", "sprites": {}}
+        if not indexed:
+            meta["theme"] = theme
+        y = 0
+        for row_entries in SPRITESHEET_ROWS:
+            rh = _align8(max(all_frames[n][f].height for n, f in row_entries))
+            x = 0
+            for name, fi in row_entries:
+                img = all_frames[name][fi]
+                key = name if len(all_frames[name]) == 1 else f"{name}_{fi}"
+                entry: dict = {
+                    "x": x * scale,
+                    "y": (y + rh - img.height) * scale,
+                    "w": img.width * scale,
+                    "h": img.height * scale,
+                }
+                if indexed:
+                    if name in PLAYER_ANIMATIONS:
+                        entry["palette_slot"] = PLAYER_PALETTE_SLOT
+                    elif name == "bowser":
+                        entry["palette_slot"] = ACTOR_ANIMATIONS["bowser_mouth_opened"]["palette"]
                     else:
-                        rgb = [list(NES_PALETTE[c & 0x3F]) for c in ACTOR_ANIMATIONS[base_name]["custom_palette"]]
-                        entry["custom_palette_rgb"] = rgb[1:]
-            meta["sprites"][key] = entry
-            x += _align8(img.width)
-        y += rh
-    (output_dir / "spritesheet.json").write_text(json.dumps(meta, indent=2))
+                        base_name = name
+                        for bname in ACTOR_ANIMATIONS:
+                            if name == bname or name.startswith(bname):
+                                base_name = bname
+                                break
+                        slot = _actor_palette_slot(base_name)
+                        if slot is not None:
+                            entry["palette_slot"] = slot
+                        else:
+                            rgb = [list(NES_PALETTE[c & 0x3F]) for c in ACTOR_ANIMATIONS[base_name]["custom_palette"]]
+                            entry["custom_palette_rgb"] = rgb[1:]
+                meta["sprites"][key] = entry
+                x += _align8(img.width)
+            y += rh
+        (output_dir / "spritesheet.json").write_text(json.dumps(meta, indent=2))
 
     # --- Palettes + reference shader (always useful for runtime palette swapping) ---
     _export_palettes_json(output_dir)
@@ -553,6 +595,8 @@ def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     indexed = "--indexed" in flags
+    individual = "--individual" in flags
+    upscale8x = "--upscale-8x" in flags
 
     here = pathlib.Path(__file__).resolve().parent
 
@@ -562,13 +606,22 @@ def main() -> None:
 
     if not rom_path.exists():
         print(f"ERROR: ROM not found at {rom_path}")
-        print("Usage: python3 smb_sprite_extractor.py [rom.nes] [output_dir] [theme] [--indexed]")
+        print("Usage: python3 smb_sprite_extractor.py [rom.nes] [output_dir] [theme] [--indexed] [--individual] [--upscale-8x]")
         print("Themes:", ", ".join(SPRITE_PALETTES))
-        print("Flags:  --indexed  Export palette-indexed sprites for shader swap")
+        print("Flags:  --indexed      Export palette-indexed sprites for shader swap")
+        print("        --individual   Export separate sprite images in output_dir/sprites")
+        print("        --upscale-8x   Export images at 8x scale")
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    export_all(rom_path, output_dir, theme, indexed=indexed)
+    export_all(
+        rom_path,
+        output_dir,
+        theme,
+        indexed=indexed,
+        individual=individual,
+        upscale8x=upscale8x,
+    )
 
 
 if __name__ == "__main__":
